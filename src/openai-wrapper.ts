@@ -5,14 +5,17 @@ import {
     Configuration, CreateChatCompletionRequest, CreateImageRequest,
     OpenAIApi
 } from "openai";
-import {openAILog as log} from "./logging"
+import { openAILog as log } from "./logging"
 
-import {PluginBase} from "./plugins/PluginBase";
-import {AiResponse, MessageData} from "./types";
+import { PluginBase } from "./plugins/PluginBase";
+import { AiResponse, MessageData } from "./types";
+import { ThinkPlugin } from "./plugins/ThinkPlugin";
+
+// Convert Map values to an array and then find the desired plugin
 
 const apiKey = process.env['OPENAI_API_KEY'];
 const basePath = process.env['OPENAI_API_BASE'];
-log.trace({apiKey, basePath})
+log.trace({ apiKey, basePath })
 
 const configuration = new Configuration({ apiKey, basePath })
 
@@ -22,7 +25,7 @@ const model = process.env['OPENAI_MODEL_NAME'] ?? 'gpt-3.5-turbo'
 const max_tokens = Number(process.env['OPENAI_MAX_TOKENS'] ?? 2000)
 const temperature = Number(process.env['OPENAI_TEMPERATURE'] ?? 1)
 
-log.debug({model, max_tokens, temperature})
+log.debug({ model, max_tokens, temperature })
 
 const plugins: Map<string, PluginBase<any>> = new Map()
 const functions: ChatCompletionFunctions[] = []
@@ -44,6 +47,18 @@ export function registerChatPlugin(plugin: PluginBase<any>) {
     })
 }
 
+function filterMathOutput(content: string): string {
+    // Replace \[...\] for block math to Mattermost markdown-compatible ```latex...```
+    content = content.replace(/\\\[(.*?)\\\]/gs, (_, formula) => `\`\`\`latex${formula}\`\`\``);
+    content = content.replace(/\$\$(.*?)\$\$/gs, (_, formula) => `\`\`\`latex${formula}\`\`\``);
+
+    // Replace \(...\) for inline math to Mattermost-compatible $...$
+    content = content.replace(/\\\((.*?)\\\)/g, (_, formula) => `$${formula}$`);
+
+    return content;
+}
+
+
 /**
  * Sends a message thread to chatGPT. The response can be the message responded by the AI model or the result of a
  * plugin call.
@@ -62,23 +77,40 @@ export async function continueThread(messages: ChatCompletionRequestMessage[], m
     const missingPlugins = new Set<string>()
 
     let isIntermediateResponse = true
-    while(isIntermediateResponse && maxChainLength-- > 0) {
+    while (isIntermediateResponse && maxChainLength-- > 0) {
         const responseMessage = await createChatCompletion(messages, functions)
         log.trace(responseMessage)
-        if(responseMessage) {
+        if (responseMessage) {
+            // handle the think part
+            let message = responseMessage.content
+            if (message) {
+                message = filterMathOutput(message)
+                responseMessage.content = message
+            }
+            if (message && message.includes("<think>")) {
+                log.trace("ThinkPlugin activated")
+                const thinkPlugin = plugins.get("think-plugin")
+                if (thinkPlugin) {
+                    aiResponse = await thinkPlugin.runPlugin({ message }, msgData);
+                    log.trace(aiResponse)
+                } else {
+                    throw new Error("ThinkPlugin isnot registered")
+                    // Handle response specific to ThinkPlugin
+                }
+            }
             // if the function_call is set, we have a plugin call
-            if(responseMessage.function_call && responseMessage.function_call.name) {
+            if (responseMessage.function_call && responseMessage.function_call.name) {
                 const pluginName = responseMessage.function_call.name;
-                log.trace({pluginName})
+                log.trace({ pluginName })
                 try {
                     const plugin = plugins.get(pluginName);
-                    if (plugin){
+                    if (plugin) {
                         const pluginArguments = JSON.parse(responseMessage.function_call.arguments ?? '[]');
-                        log.trace({plugin, pluginArguments})
+                        log.trace({ plugin, pluginArguments })
                         const pluginResponse = await plugin.runPlugin(pluginArguments, msgData)
-                        log.trace({pluginResponse})
+                        log.trace({ pluginResponse })
 
-                        if(pluginResponse.intermediate) {
+                        if (pluginResponse.intermediate) {
                             messages.push({
                                 role: ChatCompletionResponseMessageRoleEnum.Function,
                                 name: pluginName,
@@ -88,10 +120,10 @@ export async function continueThread(messages: ChatCompletionRequestMessage[], m
                         }
                         aiResponse = pluginResponse
                     } else {
-                        if (!missingPlugins.has(pluginName)){
+                        if (!missingPlugins.has(pluginName)) {
                             missingPlugins.add(pluginName)
-                            log.debug({ error: 'Missing plugin ' + pluginName, pluginArguments: responseMessage.function_call.arguments})
-                            messages.push({ role: 'system', content: `There is no plugin named '${pluginName}' available. Try without using that plugin.`})
+                            log.debug({ error: 'Missing plugin ' + pluginName, pluginArguments: responseMessage.function_call.arguments })
+                            messages.push({ role: 'system', content: `There is no plugin named '${pluginName}' available. Try without using that plugin.` })
                             continue
                         } else {
                             log.debug({ messages })
@@ -102,7 +134,7 @@ export async function continueThread(messages: ChatCompletionRequestMessage[], m
                     log.debug({ messages, error: e })
                     aiResponse.message = `Sorry, but it seems there was an error when using the plugin \`\`\`${pluginName}\`\`\`.`
                 }
-            } else if(responseMessage.content) {
+            } else if (responseMessage.content && !aiResponse.fileId) {
                 aiResponse.message = responseMessage.content
             }
         }
@@ -124,17 +156,18 @@ export async function createChatCompletion(messages: ChatCompletionRequestMessag
         messages: messages,
         max_tokens: max_tokens,
         temperature: temperature,
+        top_p: process.env['OPENAI_TOP_P'] ? Number(process.env['OPENAI_TOP_P']) : 1,
     }
-    if(functions) {
+    if (functions) {
         chatCompletionOptions.functions = functions
         chatCompletionOptions.function_call = 'auto'
     }
 
-    log.trace({chatCompletionOptions})
+    log.trace({ chatCompletionOptions })
 
     const chatCompletion = await openai.createChatCompletion(chatCompletionOptions)
 
-    log.trace({chatCompletion})
+    log.trace({ chatCompletion })
 
     return chatCompletion.data?.choices?.[0]?.message
 }
@@ -150,8 +183,8 @@ export async function createImage(prompt: string): Promise<string | undefined> {
         size: '512x512',
         response_format: 'b64_json'
     };
-    log.trace({createImageOptions})
+    log.trace({ createImageOptions })
     const image = await openai.createImage(createImageOptions)
-    log.trace({image})
+    log.trace({ image })
     return image.data?.data[0]?.b64_json
 }

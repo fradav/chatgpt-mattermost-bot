@@ -1,18 +1,19 @@
-import {continueThread, registerChatPlugin} from "./openai-wrapper";
-import {mmClient, wsClient} from "./mm-client";
+import { continueThread, registerChatPlugin } from "./openai-wrapper";
+import { mmClient, wsClient } from "./mm-client";
 import 'babel-polyfill'
 import 'isomorphic-fetch'
-import {WebSocketMessage} from "@mattermost/client";
-import {ChatCompletionRequestMessage, ChatCompletionRequestMessageRoleEnum} from "openai";
-import {GraphPlugin} from "./plugins/GraphPlugin";
-import {ImagePlugin} from "./plugins/ImagePlugin";
-import {Post} from "@mattermost/types/lib/posts";
-import {PluginBase} from "./plugins/PluginBase";
-import {JSONMessageData, MessageData} from "./types";
-import {ExitPlugin} from "./plugins/ExitPlugin";
-import {MessageCollectPlugin} from "./plugins/MessageCollectPlugin";
+import { WebSocketMessage } from "@mattermost/client";
+import { ChatCompletionRequestMessage, ChatCompletionRequestMessageRoleEnum } from "openai";
+import { GraphPlugin } from "./plugins/GraphPlugin";
+import { ImagePlugin } from "./plugins/ImagePlugin";
+import { Post } from "@mattermost/types/lib/posts";
+import { PluginBase } from "./plugins/PluginBase";
+import { JSONMessageData, MessageData } from "./types";
+import { ExitPlugin } from "./plugins/ExitPlugin";
+import { MessageCollectPlugin } from "./plugins/MessageCollectPlugin";
+import { ThinkPlugin } from "./plugins/ThinkPlugin";
 
-import {botLog, matterMostLog} from "./logging";
+import { botLog, matterMostLog } from "./logging";
 
 if (!global.FormData) {
     global.FormData = require('form-data')
@@ -23,6 +24,9 @@ const contextMsgCount = Number(process.env['BOT_CONTEXT_MSG'] ?? 100)
 const additionalBotInstructions = process.env['BOT_INSTRUCTION'] || "You are a helpful assistant. Whenever users asks you for help you will " +
     "provide them with succinct answers formatted using Markdown. You know the user's name as it is provided within the " +
     "meta data of the messages."
+// +
+// "Pay attention when outputting math : 1. inline math formulae must be formatted using $... $ " +
+// "2. block math formulae must be formatted with markdown code block ```latex... ```"
 
 /* List of all registered plugins */
 const plugins: PluginBase<any>[] = [
@@ -30,20 +34,52 @@ const plugins: PluginBase<any>[] = [
     new ImagePlugin("image-plugin", "Generates an image based on a given image description."),
     new ExitPlugin("exit-plugin", "Says goodbye to the user and wish him a good day."),
     new MessageCollectPlugin("message-collect-plugin", "Collects messages in the thread for a specific user or time"),
+    new ThinkPlugin()
 ]
 
 /* The main system instruction for GPT */
 const botInstructions = "Your name is " + name + ". " + additionalBotInstructions
-botLog.debug({botInstructions: botInstructions})
+botLog.debug({ botInstructions: botInstructions })
+
+function splitMessage(content: string, maxLength: number = 16383): string[] {
+    const chunks = [];
+    const lines = content.split("\n"); // Split at newlines
+
+    let currentChunk = "";
+    let insideMarkdownBlock = false;
+
+    for (const line of lines) {
+        // Check for Markdown block start or end
+        if (line.trim().startsWith("```")) {
+            insideMarkdownBlock = !insideMarkdownBlock; // Toggle Markdown block state
+        }
+
+        // Check if current chunk exceeds max length & we're not in a Markdown block
+        if (!insideMarkdownBlock && currentChunk.length + line.length + 1 > maxLength) {
+            chunks.push(currentChunk.trim()); // Add current chunk
+            currentChunk = ""; // Reset chunk
+        }
+
+        currentChunk += line + "\n"; // Add the line with newline
+    }
+
+    if (currentChunk) {
+        chunks.push(currentChunk.trim()); // Add the last chunk
+    }
+
+    return chunks;
+}
+
+
 
 async function onClientMessage(msg: WebSocketMessage<JSONMessageData>, meId: string) {
     if (msg.event !== 'posted' || !meId) {
-        matterMostLog.debug({msg: msg})
+        matterMostLog.debug({ msg: msg })
         return
     }
 
     const msgData = parseMessageData(msg.data)
-    const posts = await getOlderPosts(msgData.post, {lookBackTime: 1000 * 60 * 60 * 24})
+    const posts = await getOlderPosts(msgData.post, { lookBackTime: 1000 * 60 * 60 * 24 })
 
     if (isMessageIgnored(msgData, meId, posts)) {
         return
@@ -58,7 +94,7 @@ async function onClientMessage(msg: WebSocketMessage<JSONMessageData>, meId: str
 
     // create the context
     for (const threadPost of posts.slice(-contextMsgCount)) {
-        matterMostLog.trace({msg: threadPost})
+        matterMostLog.trace({ msg: threadPost })
         if (threadPost.user_id === meId) {
             chatmessages.push({
                 role: ChatCompletionRequestMessageRoleEnum.Assistant,
@@ -79,18 +115,29 @@ async function onClientMessage(msg: WebSocketMessage<JSONMessageData>, meId: str
     const typingInterval = setInterval(typing, 2000)
 
     try {
-        const {message, fileId, props} = await continueThread(chatmessages, msgData)
-        botLog.trace({message})
-
+        const { message, fileId, props } = await continueThread(chatmessages, msgData)
+        botLog.trace({ message })
+        const messages = splitMessage(message)
         // create answer response
         const newPost = await mmClient.createPost({
-            message: message,
+            message: messages[0],
             channel_id: msgData.post.channel_id,
             props,
             root_id: msgData.post.root_id || msgData.post.id,
             file_ids: fileId ? [fileId] : undefined
         })
-        botLog.trace({msg: newPost})
+        if (messages.length > 1) {
+            for (const msg of messages.slice(1)) {
+                await mmClient.createPost({
+                    message: msg,
+                    channel_id: msgData.post.channel_id,
+                    props,
+                    root_id: msgData.post.root_id || msgData.post.id
+                })
+            }
+        }
+
+        botLog.trace({ msg: newPost })
     } catch (e) {
         botLog.error(e)
         await mmClient.createPost({
